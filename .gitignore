@@ -1,4 +1,3 @@
-
 **/*.pt
 **/checkpoints
 **/wget-log
@@ -9,6 +8,8 @@
 **/playground
 **/wandb
 **/data
+
+/pyrightconfig.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -22,7 +23,7 @@ tensorflow/my_graph/*
 
 # Distribution / packaging
 .Python
-env/
+# env/
 build/
 develop-eggs/
 dist/
@@ -59,6 +60,8 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+pytest.ini
+output.txt
 
 # Translations
 *.mo
@@ -110,11 +113,11 @@ ENV/
 # Mac
 .DS_Store
 
-# output logs
-tests/e2e/toy_examples/deepspeed/synchronous/output.txt
-
 # vim
 *.swp
+
+# emacs
+*~
 
 # ckpt
 *.lock
@@ -127,3 +130,4 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 logs
 log
 outputs
+.history

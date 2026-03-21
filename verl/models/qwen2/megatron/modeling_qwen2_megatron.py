@@ -19,7 +19,7 @@
 # limitations under the License.
 """PyTorch Qwen2 model."""
 
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 import torch.utils.checkpoint
@@ -29,6 +29,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import CausalLMOutputWithPast
 
+from verl.utils.device import get_device_name
 from verl.utils.megatron import sequence_parallel as sp_utils
 from verl.utils.megatron import tensor_parallel as tp_utils
 from verl.utils.megatron_utils import TransformerConfig, convert_config
@@ -125,7 +126,7 @@ class ParallelQwen2Model(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> tuple | BaseModelOutputWithPast:
         """
 
         Args:
@@ -184,7 +185,7 @@ class ParallelQwen2ForCausalLM(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -217,7 +218,7 @@ class ParallelQwen2ForCausalLM(nn.Module):
         )
 
 
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa: F401, E402
 
 
 class ParallelQwen2ModelRmPad(nn.Module):
@@ -255,7 +256,7 @@ class ParallelQwen2ModelRmPad(nn.Module):
         indices: torch.Tensor = None,
         cu_seqlens: int = None,
         max_seqlen_in_batch: int = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> tuple | BaseModelOutputWithPast:
         """
 
         Args:
@@ -325,7 +326,7 @@ class ParallelQwen2ForCausalLMRmPad(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -404,7 +405,7 @@ class ParallelQwen2ForValueRmPad(ParallelQwen2ForCausalLMRmPad):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         output = super().forward(input_ids, attention_mask, position_ids)
         output.logits = torch.squeeze(output.logits, dim=-1)
         return output
@@ -486,7 +487,7 @@ class ParallelQwen2ModelRmPadPP(nn.Module):
         indices: torch.Tensor = None,
         cu_seqlens: int = None,
         max_seqlen_in_batch: int = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> tuple | BaseModelOutputWithPast:
         """
 
         Args:
@@ -582,7 +583,7 @@ class ParallelQwen2ForCausalLMRmPadPP(nn.Module):
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.
 
-        This function initalizes word embeddings in the final stage when we are
+        This function initializes word embeddings in the final stage when we are
         using pipeline parallelism and sharing word embeddings, and sets up param
         attributes on the embedding and output layers.
         """
@@ -615,7 +616,7 @@ class ParallelQwen2ForCausalLMRmPadPP(nn.Module):
 
         if torch.distributed.is_initialized() and parallel_state.is_rank_in_embedding_group():
             weight = self.shared_embedding_or_output_weight()
-            weight.data = weight.data.cuda()
+            weight.data = weight.data.to(get_device_name())
             torch.distributed.all_reduce(weight.data, group=parallel_state.get_embedding_group())
 
     def shared_embedding_or_output_weight(self) -> torch.Tensor:
@@ -627,7 +628,8 @@ class ParallelQwen2ForCausalLMRmPadPP(nn.Module):
 
     def _forward_head(self, hidden_states):
         # all_gather from sequence parallel region is performed inside lm_head
-        # print(f'logits shape before forward_head: {hidden_states.shape}, vocab_size = {self.config.vocab_size}') # [4, 32, 4096]
+        # print(f'logits shape before forward_head: {hidden_states.shape}, vocab_size = '
+        # f'{self.config.vocab_size}') # [4, 32, 4096]
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
@@ -643,7 +645,7 @@ class ParallelQwen2ForCausalLMRmPadPP(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -726,7 +728,7 @@ class ParallelQwen2ForValueRmPadPP(ParallelQwen2ForCausalLMRmPadPP):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> tuple | CausalLMOutputWithPast:
         output = super().forward(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)
         if self.post_process:
             output.logits = torch.squeeze(output.logits, dim=-1)

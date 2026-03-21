@@ -16,10 +16,20 @@ A unified tracking interface that supports logging data to different backend
 """
 
 import dataclasses
+import json
+import logging
+import os
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any
+
+import orjson
+
+logger = logging.getLogger(__name__)
+
+MLFLOW_MAX_ATTEMPTS = 3
+MLFLOW_SLEEP_SECONDS = 5
 
 
 class Tracking(object):
@@ -42,7 +52,7 @@ class Tracking(object):
             if backend == "tracking":
                 import warnings
 
-                warnings.warn("`tracking` logger is deprecated. use `wandb` instead.", DeprecationWarning)
+                warnings.warn("`tracking` logger is deprecated. use `wandb` instead.", DeprecationWarning, stacklevel=2)
             else:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
@@ -50,26 +60,57 @@ class Tracking(object):
         self.default_backend = default_backend
 
         if "tracking" in default_backend or "wandb" in default_backend:
+            import os
+
             import wandb
 
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            settings = None
+            if config and config["trainer"].get("wandb_proxy", None):
+                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+            entity = os.environ.get("WANDB_ENTITY", None)
+            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb
+
+        if "trackio" in default_backend:
+            import trackio
+
+            trackio.init(project=project_name, name=experiment_name, config=config)
+            self.logger["trackio"] = trackio
 
         if "mlflow" in default_backend:
             import os
+            import time
 
             import mlflow
 
-            MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", None)
-            if MLFLOW_TRACKING_URI:
-                mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+            for _mlflow_attempt in range(1, MLFLOW_MAX_ATTEMPTS + 1):
+                try:
+                    MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:////tmp/mlruns.db")
+                    logger.info("Using MLFlow tracking URI: %s", MLFLOW_TRACKING_URI)
+                    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
-            # Project_name is actually experiment_name in MLFlow
-            # If experiment does not exist, will create a new experiment
-            experiment = mlflow.set_experiment(project_name)
-            mlflow.start_run(experiment_id=experiment.experiment_id, run_name=experiment_name)
-            mlflow.log_params(_compute_mlflow_params_from_objects(config))
-            self.logger["mlflow"] = _MlflowLoggingAdapter()
+                    # Some cloud providers like Azure ML or Databricks automatically set MLFLOW_RUN_ID
+                    # If set, attach to the existing run instead of creating a new one
+                    run_id = os.environ.get("MLFLOW_RUN_ID")
+                    if run_id:
+                        mlflow.start_run(run_id=run_id)
+                    else:
+                        # Project_name is actually experiment_name in MLFlow
+                        # If experiment does not exist, will create a new experiment
+                        experiment = mlflow.set_experiment(project_name)
+                        mlflow.start_run(experiment_id=experiment.experiment_id, run_name=experiment_name)
+
+                    mlflow.log_params(_compute_mlflow_params_from_objects(config))
+                    self.logger["mlflow"] = _MlflowLoggingAdapter()
+                    break  # Success
+                except Exception as e:
+                    logger.warning(
+                        "MLflow initialization attempt %d/%d failed: %s", _mlflow_attempt, MLFLOW_MAX_ATTEMPTS, e
+                    )
+                    if _mlflow_attempt < MLFLOW_MAX_ATTEMPTS:
+                        time.sleep(MLFLOW_SLEEP_SECONDS)
+                    else:
+                        logger.warning("All MLflow initialization attempts failed. Proceeding without MLflow tracking.")
 
         if "swanlab" in default_backend:
             import os
@@ -81,10 +122,13 @@ class Tracking(object):
             SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "cloud")
             if SWANLAB_API_KEY:
                 swanlab.login(SWANLAB_API_KEY)  # NOTE: previous login information will be overwritten
+
+            if config is None:
+                config = {}  # make sure config is not None, otherwise **config will raise error
             swanlab.init(
                 project=project_name,
                 experiment_name=experiment_name,
-                config={"FRAMEWORK": "veRL", **config},
+                config={"FRAMEWORK": "verl", **config},
                 logdir=SWANLAB_LOG_DIR,
                 mode=SWANLAB_MODE,
             )
@@ -127,7 +171,7 @@ class Tracking(object):
             )
 
         if "console" in default_backend:
-            from verl.utils.logger.aggregate_logger import LocalLogger
+            from verl.utils.logger import LocalLogger
 
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger["console"] = self.console_logger
@@ -151,12 +195,12 @@ class Tracking(object):
 
 
 class _TensorboardAdapter:
-    def __init__(self):
+    def __init__(self, project_name, experiment_name):
         import os
 
         from torch.utils.tensorboard import SummaryWriter
 
-        tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "tensorboard_log")
+        tensorboard_dir = os.environ.get("TENSORBOARD_DIR", f"tensorboard_log/{project_name}/{experiment_name}")
         os.makedirs(tensorboard_dir, exist_ok=True)
         print(f"Saving tensorboard log to {tensorboard_dir}.")
         self.writer = SummaryWriter(tensorboard_dir)
@@ -170,14 +214,47 @@ class _TensorboardAdapter:
 
 
 class _MlflowLoggingAdapter:
+    def __init__(self):
+        import logging
+        import re
+
+        self.logger = logging.getLogger(__name__)
+        # Suppress noisy "Found credentials from IAM Role" on every MLflow request
+        logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
+        # MLflow metric key validation logic:
+        # https://github.com/mlflow/mlflow/blob/master/mlflow/utils/validation.py#L157C12-L157C44
+        # Only characters allowed: slashes, alphanumerics, underscores, periods, dashes, colons,
+        # and spaces.
+        self._invalid_chars_pattern = re.compile(
+            r"[^/\w.\- :]"
+        )  # Allowed: slashes, alphanumerics, underscores, periods, dashes, colons, and spaces.
+        self._consecutive_slashes_pattern = re.compile(r"/+")
+        self._sanitized_key_cache = {}
+
+    def _sanitize_key(self, key):
+        if key in self._sanitized_key_cache:
+            return self._sanitized_key_cache[key] or key
+        # First replace @ with _at_ for backward compatibility
+        sanitized = key.replace("@", "_at_")
+        # Replace consecutive slashes with a single slash (MLflow treats them as file paths)
+        sanitized = self._consecutive_slashes_pattern.sub("/", sanitized)
+        # Then replace any other invalid characters with _
+        sanitized = self._invalid_chars_pattern.sub("_", sanitized)
+        if sanitized == key:
+            self._sanitized_key_cache[key] = None
+        else:
+            self.logger.warning("[MLflow] Metric key '%s' sanitized to '%s' due to invalid characters.", key, sanitized)
+            self._sanitized_key_cache[key] = sanitized
+        return sanitized
+
     def log(self, data, step):
         import mlflow
 
-        results = {k.replace("@", "_at_"): v for k, v in data.items()}
+        results = {self._sanitize_key(k): v for k, v in data.items()}
         mlflow.log_metrics(metrics=results, step=step)
 
 
-def _compute_mlflow_params_from_objects(params) -> Dict[str, Any]:
+def _compute_mlflow_params_from_objects(params) -> dict[str, Any]:
     if params is None:
         return {}
 
@@ -204,7 +281,7 @@ def _transform_params_to_json_serializable(x, convert_list_to_dict: bool):
     return x
 
 
-def _flatten_dict(raw: Dict[str, Any], *, sep: str) -> Dict[str, Any]:
+def _flatten_dict(raw: dict[str, Any], *, sep: str) -> dict[str, Any]:
     import pandas as pd
 
     ans = pd.json_normalize(raw, sep=sep).to_dict(orient="records")[0]
@@ -214,6 +291,9 @@ def _flatten_dict(raw: Dict[str, Any], *, sep: str) -> Dict[str, Any]:
 
 @dataclasses.dataclass
 class ValidationGenerationsLogger:
+    project_name: str = None
+    experiment_name: str = None
+
     def log(self, loggers, samples, step):
         if "wandb" in loggers:
             self.log_generations_to_wandb(samples, step)
@@ -222,9 +302,26 @@ class ValidationGenerationsLogger:
         if "mlflow" in loggers:
             self.log_generations_to_mlflow(samples, step)
 
+        if "clearml" in loggers:
+            self.log_generations_to_clearml(samples, step)
+        if "tensorboard" in loggers:
+            self.log_generations_to_tensorboard(samples, step)
+
+        if "vemlp_wandb" in loggers:
+            self.log_generations_to_vemlp_wandb(samples, step)
+
+    def log_generations_to_vemlp_wandb(self, samples, step):
+        from volcengine_ml_platform import wandb as vemlp_wandb
+
+        self._log_generations_to_wandb(samples, step, vemlp_wandb)
+
     def log_generations_to_wandb(self, samples, step):
-        """Log samples to wandb as a table"""
         import wandb
+
+        self._log_generations_to_wandb(samples, step, wandb)
+
+    def _log_generations_to_wandb(self, samples, step, wandb):
+        """Log samples to wandb as a table"""
 
         # Create column names for all samples
         columns = ["step"] + sum(
@@ -248,36 +345,29 @@ class ValidationGenerationsLogger:
         new_table.add_data(*row_data)
 
         # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
+        if wandb.run is not None:
+            wandb.log({"val/generations": new_table}, step=step)
         self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):
         """Log samples to swanlab as text"""
         import swanlab
 
-        swanlab_text_list = []
-        for i, sample in enumerate(samples):
-            row_text = f"""
-            input: {sample[0]}
-            
-            ---
-            
-            output: {sample[1]}
-            
-            ---
-            
-            score: {sample[2]}
-            """
-            swanlab_text_list.append(swanlab.Text(row_text, caption=f"sample {i + 1}"))
+        swanlab_table = swanlab.echarts.Table()
+
+        # Create column names
+        headers = ["step", "input", "output", "score"]
+
+        swanlab_row_list = [[step, *sample] for sample in samples]
+        swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab
-        swanlab.log({"val/generations": swanlab_text_list}, step=step)
+        swanlab.log({"val/generations": swanlab_table}, step=step)
 
     def log_generations_to_mlflow(self, samples, step):
         """Log validation generation to mlflow as artifacts"""
         # https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html?highlight=log_artifact#mlflow.log_artifact
 
-        import json
         import tempfile
 
         import mlflow
