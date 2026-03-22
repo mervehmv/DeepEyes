@@ -20,7 +20,6 @@ home_dir="/arf/scratch/hvural"
 apptainer_image_path="/arf/scratch/hvural/verl_vllm017_latest.sif"
 PROJECT_NAME="agent_vlagent"
 EXPERIMENT_NAME="qwen25_vl_7b_instruct_vl_agent_v2"
-export WANDB_API_KEY=1eb4d00dda86dd502dec6fe7b45a8dfe90a4824c
 export LLM_AS_A_JUDGE_BASE="http://kolyoz25.ib:18901/v1"
 # export TOKENIZERS_PARALLELISM=false
 export SAVE_CHECKPOINT_DIR=/arf/scratch/hvural/DeepEyes/checkpoints
@@ -90,8 +89,6 @@ srun --nodes=1 --ntasks=1 apptainer exec --nv \
     export RAY_TMPDIR=/tmp/ray_${SLURM_JOB_ID:-local}
     mkdir -p \"\$RAY_TMPDIR\"
     
-    export WANDB_API_KEY=1eb4d00dda86dd502dec6fe7b45a8dfe90a4824c
-
     cleanup() { 
         echo \"Stopping Ray...\"
         ray stop --force || true
