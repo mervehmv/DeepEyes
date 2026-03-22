@@ -87,6 +87,19 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    
+    # New agent fields from ppo_trainer.yaml
+    activate_agent: bool = False
+    single_response_max_tokens: int = 32768
+    max_turns: int = 50
+    concurrent_workers: int = 1
+    tool_name_key: Optional[str] = "env_name"
+    tool_meta_key: Optional[str] = None
+    custom_stop: list = field(default_factory=list)
+    show_tqdm: bool = True
+    vl_model_path: Optional[str] = None
+    max_vllm_images: int = 32
+    max_vllm_videos: int = 1
 
 
 @dataclass
@@ -166,6 +179,7 @@ class RolloutConfig(BaseConfig):
     top_k: int = -1
     top_p: float = 1.0
     do_sample: bool = True
+    use_fire_sampling: bool = False
     n: int = 1
     repetition_penalty: float = 1.0
 

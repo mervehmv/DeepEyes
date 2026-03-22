@@ -347,13 +347,24 @@ def _get_input_embeds(
         image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
+        image_tokens_mask = input_ids == model.config.image_token_id
         if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            logger.warning(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}. "
+                "Attempting to adjust mask for consistency."
             )
+            if n_image_tokens > n_image_features:
+                # Too many tokens, only keep the first n_image_features
+                indices = torch.where(image_tokens_mask)
+                # Correctly slice indices for all dimensions
+                row_indices = indices[0][n_image_features:]
+                col_indices = indices[1][n_image_features:]
+                image_tokens_mask[row_indices, col_indices] = False
+            else:
+                # Too many features, truncate features to match tokens
+                image_embeds = image_embeds[:n_image_tokens]
 
-        mask = input_ids == model.config.image_token_id
-        mask_unsqueezed = mask.unsqueeze(-1)
+        mask_unsqueezed = image_tokens_mask.unsqueeze(-1)
         mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
         image_mask = mask_expanded.to(inputs_embeds.device)
 
@@ -365,13 +376,21 @@ def _get_input_embeds(
         video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
+        video_tokens_mask = input_ids == model.config.video_token_id
         if n_video_tokens != n_video_features:
-            raise ValueError(
-                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+            logger.warning(
+                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}. "
+                "Attempting to adjust mask for consistency."
             )
+            if n_video_tokens > n_video_features:
+                indices = torch.where(video_tokens_mask)
+                row_indices = indices[0][n_video_features:]
+                col_indices = indices[1][n_video_features:]
+                video_tokens_mask[row_indices, col_indices] = False
+            else:
+                video_embeds = video_embeds[:n_video_tokens]
 
-        mask = input_ids == model.config.video_token_id
-        mask_unsqueezed = mask.unsqueeze(-1)
+        mask_unsqueezed = video_tokens_mask.unsqueeze(-1)
         mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
         video_mask = mask_expanded.to(inputs_embeds.device)
 

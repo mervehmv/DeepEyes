@@ -124,6 +124,8 @@ ENV/
 
 # data
 *.parquet
+*.jsonl
+caption_dataset_rl_v7/
 
 
 # local logs
@@ -131,3 +133,6 @@ logs
 log
 outputs
 .history
+eval_grounded.log
+slurm-*.out
+slurm-*.err

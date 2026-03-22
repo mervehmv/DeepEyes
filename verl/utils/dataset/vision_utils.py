@@ -13,11 +13,11 @@
 # limitations under the License.
 
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from PIL import Image
-
+from qwen_vl_utils import fetch_image, fetch_video
 
 def process_raw_image(image: dict):
     from PIL import Image
@@ -52,7 +52,6 @@ def process_image(image: Union[dict, Image.Image]) -> Image.Image:
 
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
-        image["image"] = Image.open(BytesIO(image["bytes"]))
         image["image"] = Image.open(BytesIO(image["bytes"]))
 
     try:

@@ -510,12 +510,30 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "action_mask"]
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages",
+        ]
+        if self.use_prefix_grouper and "prompts" in data.batch.keys():
+            select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        batch = data.select(batch_keys=select_keys, strict=False).batch
+        # Include pre-computed IS weights if present in batch
+        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        if "rollout_is_weights" in data.batch.keys():
+            select_keys.append("rollout_is_weights")
+        # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
+        if "rollout_log_probs" in data.batch.keys():
+            select_keys.append("rollout_log_probs")
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
@@ -527,25 +545,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
-            non_tensor_select_keys = ["multi_modal_inputs"]
-            dataloader = data.select(select_keys, non_tensor_select_keys, strict=False).chunk(num_mini_batches)
-        else:
-            dataloader = batch.split(self.config.ppo_mini_batch_size)
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        metrics = {}
-        for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
-                # split batch into micro_batches
-                mini_batch = data
-                if has_multi_modal_inputs:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys, strict=False).chunk(num_micro_batches)
-                elif self.config.use_dynamic_bsz:
+        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+        metrics = {
+            "actor/pg_loss": 0.0,
+            "actor/kl_loss": 0.0,
+        }
+        for _ in range(self.config.ppo_epochs):
+            for batch_idx, mini_batch in enumerate(mini_batches):
+                if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
@@ -556,28 +566,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for data in micro_batches:
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
-                    else:
-                        data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
-                    responses = data["responses"]
-                    response_length = responses.size(1)
-                    action_or_attn_mask = data['action_mask'] if 'action_mask' in data.keys() else data['attention_mask']
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+                    micro_batch_metrics = {}
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                    response_mask = model_inputs["response_mask"]
+                    old_log_prob = model_inputs["old_log_probs"]
+                    advantages = model_inputs["advantages"]
 
-                    response_mask = action_or_attn_mask[:, -response_length:]
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = (
-                        self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    )
-                    clip_ratio_high = (
-                        self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    )
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 

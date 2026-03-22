@@ -138,8 +138,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+    score_mean = torch.mean(sequence_score).detach().item()
+    score_max = torch.max(sequence_score).detach().item()
+    score_min = torch.min(sequence_score).detach().item()
+    reward_mean = torch.mean(sequence_reward).detach().item()
+    reward_max = torch.max(sequence_reward).detach().item()
+    reward_min = torch.min(sequence_reward).detach().item()
+
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
+    if 'aborted_mask' in batch.batch:
+        aborted_mask = batch.batch['aborted_mask'].bool()
+    else:
+        aborted_mask = torch.zeros_like(sequence_score, dtype=torch.bool)
+
+    non_aborted_mask = ~aborted_mask
+
     aborted_ratio = torch.mean(aborted_mask.float()).detach().item()
 
     non_aborted_response_length = response_length[non_aborted_mask]

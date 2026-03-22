@@ -60,7 +60,7 @@ def migrate_legacy_reward_impl(config):
 
     # 4. reward model migration
     # config.reward_model -> config.reward.reward_model
-    for key in ["enable", "enable_resource_pool", "n_gpus_per_node", "nnodes"]:
+    for key in ["enable", "enable_resource_pool", "n_gpus_per_node", "nnodes", "launch_reward_fn_async"]:
         if config.reward_model.get(key) is not None:
             config.reward.reward_model[key] = config.reward_model[key]
     if config.reward_model.model.path is not None:

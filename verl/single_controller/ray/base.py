@@ -46,13 +46,21 @@ def get_random_string(length: int) -> str:
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
-    def func(*args, **kwargs):
-        args, kwargs = dispatch_fn(self, *args, **kwargs)
-        output = execute_fn(method_name, *args, **kwargs)
-        if blocking:
-            output = ray.get(output)
-        output = collect_fn(self, output)
-        return output
+    class Functor:
+        def __call__(this, *args, **kwargs):
+            args, kwargs = dispatch_fn(self, *args, **kwargs)
+            padding_count = kwargs.pop(_padding_size_key, 0)
+            output = execute_fn(method_name, *args, **kwargs)
+            if blocking:
+                output = ray.get(output)
+            output = collect_fn(self, output)
+            if padding_count > 0:
+                if isinstance(output, DataProto):
+                    indices = [i for i in range(len(output))][:-padding_count]
+                    output = output.select_idxs(indices)
+                elif isinstance(output, list):
+                    output = output[:-padding_count]
+            return output
 
     # use class type to pass the method_name to get a better observability
     return type(method_name, (Functor,), {})()

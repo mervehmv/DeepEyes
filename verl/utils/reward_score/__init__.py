@@ -13,7 +13,7 @@
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
 import torch
-
+from verl.utils.import_utils import deprecated
 def default_compute_score(
     data_source,
     solution_str,
@@ -96,7 +96,7 @@ def default_compute_score(
         from . import agent
         res = agent.compute_score_eval(solution_str, ground_truth)
 
-    elif data_source in ['vstar', 'vl_agent', 'chart']:
+    elif data_source in ['vstar', 'vl_agent', 'chart', 'humor']:
         from . import vl_agent
         res = vl_agent.compute_score(solution_str, ground_truth, extra_info)
 

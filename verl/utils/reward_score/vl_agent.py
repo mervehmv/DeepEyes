@@ -3,6 +3,8 @@ import requests
 import random
 import re
 import os
+import datetime
+import json
 
 from math_verify import parse, verify
 
@@ -14,17 +16,22 @@ openai_api_base_list = [
 ]
 
 client_list = []
+model_name_list = []
 for api_base in openai_api_base_list:
     client = OpenAI(
         api_key=openai_api_key,
         base_url=api_base,
     )
     client_list.append(client)
-model_name_list = []
-for client in client_list:
-    response = requests.get(f"{api_base}/models")
-    models = response.json()
-    model_name_list.append(models['data'][0]['id'])
+    try:
+        response = requests.get(f"{api_base}/models", timeout=10)
+        response.raise_for_status()
+        models = response.json()
+        model_name_list.append(models['data'][0]['id'])
+    except Exception as e:
+        print(f"Warning: Failed to fetch models from {api_base}: {e}. Falling back to default model name.")
+        # Default fallback for judge model if API is unreachable
+        model_name_list.append("judge")
 
 
 
@@ -147,9 +154,39 @@ Professional, scientific.
 
 **Reference Answer**
 {gold_ans}
-
+ 
 ## Student Final Answer
 {pred_ans}"""
+ 
+ 
+def log_judge_interaction(judge_type, question, gold_ans, pred_ans, judge_response, score, extra_info=None):
+    log_dir = "/arf/scratch/hvural/DeepEyes/logs/vl_agent"
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        # Use PID and timestamp for unique files per worker
+        log_file = os.path.join(log_dir, f"judge_log_{os.getpid()}.jsonl")
+        
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "judge_type": judge_type,
+            "question": question,
+            "gold_ans": gold_ans,
+            "pred_ans": pred_ans,
+            "judge_response": judge_response,
+            "score": score
+        }
+        if extra_info:
+            entry.update({"extra_info": extra_info})
+        
+        def numpy_default(obj):
+            if hasattr(obj, 'item'):
+                return obj.item()
+            return str(obj)
+
+        with open(log_file, "a") as f:
+            f.write(json.dumps(entry, default=numpy_default) + "\n")
+    except Exception as e:
+        print(f" [ERROR] Failed to log judge interaction: {e}")
 
 
 def get_prompt(predict_str, ground_truth, question):
@@ -187,12 +224,69 @@ def extract_answer(text):
     return None
 
 
+def extract_choice_letter(text):
+    """
+    Extracts the choice letter (A-E) from text.
+    Handles formats like 'A)', 'A.', 'Choice: A', etc.
+    """
+    if not text:
+        return ""
+    # Look for a standalone letter A-E, or A-E followed by ) or . or : at the beginning or after a word boundary
+    # This tries to pick the most likely choice letter.
+    match = re.search(r'\b([A-E])\s*[\)\.\:]|(?:\b|^)([A-E])(?:\b|$)', text, re.IGNORECASE)
+    if match:
+        letter = match.group(1) or match.group(2)
+        return letter.upper()
+    return text
+
+
+def call_judge(prompt):
+    client_idx = random.randint(0, len(client_list) - 1)
+    client = client_list[client_idx]
+    model_name = model_name_list[client_idx]
+
+    chat_response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        seed = random.randint(0, 1000000),
+        temperature=0.3,
+    )
+    response = chat_response.choices[0].message.content.strip()
+    
+    # Check for Equivalence Judgement (Markdown Report style)
+    if '## Equivalence Judgement' in response:
+        judgement_part = response.split('## Equivalence Judgement')[-1].lower()
+        if 'true' in judgement_part and 'false' not in judgement_part:
+            return 1.0, response
+        elif 'false' in judgement_part and 'true' not in judgement_part:
+            return 0.0, response
+
+    if 'Judgement:' in response:
+        judgement_part = response.split('Judgement:')[-1].strip()
+        if '1' in judgement_part:
+            return 1.0, response
+        elif '0' in judgement_part:
+            return 0.0, response
+    
+    if response == '1':
+        return 1.0, response
+    elif response == '0':
+        return 0.0, response
+    
+    print(f' [WARNING] resp format error {response=}')
+    return 0.0, response
+
+
 def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> float:
     is_format_error = False
-    # predict_str = "<think>" + predict_str
+    
+    # 1. Format checking
     count_think_1 = predict_str.count("<think>")
     count_think_2 = predict_str.count("</think>")
-    if count_think_1 != count_think_2:
+    if count_think_1 != count_think_2 or count_think_1 == 0:
         is_format_error = True
 
     count_vision_1 = predict_str.count("<|vision_start|><|image_pad|>")
@@ -203,67 +297,68 @@ def compute_score(predict_str: str, ground_truth: str, extra_info=None) -> float
     predict_no_think = predict_str.split('</think>')[-1].strip()
     count_answer_1 = predict_no_think.count("<answer>")
     count_answer_2 = predict_no_think.count("</answer>")
-    if count_answer_1 != count_answer_2:
+    if count_answer_1 != count_answer_2 or count_answer_1 == 0:
         is_format_error = True
 
-    answer_text = predict_str.split("<answer>")[-1].split("</answer>")[0].strip()
-
-    # pattern = re.compile(r'<\|im_start\|>assistant(.*?)$', re.DOTALL)  # 匹配最后一个 target 后的所有内容
-    # match = pattern.search(predict_str)
-    # if match:
-    #     answer_text = match.group(1).strip()
-    #     print(f'DEBUG{answer_text=}')
-    # else:
-    #     answer_text = ""
-
-    question_text = extra_info['question']
-    full_prompt = get_prompt(answer_text, ground_truth, question_text)
-
-    client_idx = random.randint(0, len(client_list) - 1)
-    client = client_list[client_idx]
-    model_name = model_name_list[client_idx]
-
-    chat_response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": full_prompt},
-        ],
-        seed = random.randint(0, 1000000),
-        temperature=0.3,
-    )
-    response = chat_response.choices[0].message.content.strip()
-    # print(response)
-    if 'Judgement:' in response:
-        response = response.split('Judgement:')[-1].strip()
-        if '1' in response:
-            acc_reward = 1.0
-        elif '0' in response:
-            acc_reward = 0.0
-        else:
-            print(f' [WARNING] resp format error {response=}')
-            acc_reward = 0.0
-    else:
-        if response == '1':
-            acc_reward = 1.0
-        elif response == '0':
-            acc_reward = 0.0
-        else:
-            print(f' [WARNING] resp format error {response=}')
-            acc_reward = 0.0
+    # 2. Component extraction
+    reason_text = ""
+    if count_think_1 > 0:
+        reason_text = predict_str.split("<think>")[-1].split("</think>")[0].strip()
+    
+    answer_text = ""
+    if count_answer_1 > 0:
+        raw_answer_text = predict_no_think.split("<answer>")[-1].split("</answer>")[0].strip()
+        answer_text = extract_choice_letter(raw_answer_text)
 
     # Penalize for model trying to predict longer answer to hack llm-as-judge
     if len(answer_text) >= 1000:
-        acc_reward = 0.0
         is_format_error = True
 
-    tool_reward_base = 1.0 if count_vision_1 > 0 else 0.0
-    tool_reward = 1.0 if count_vision_1 > 0 and acc_reward > 0.5 else 0.0
+    # 3. Judge Auxiliary Reasoning (Extra Info)
+    aux_reward = 0.0
+    reasoning_judge_resp = "N/A"
+    if extra_info and 'question' in extra_info and 'answer' in extra_info:
+        aux_question = extra_info['question']
+        aux_gold = extra_info['answer']
+        # Use more robust prompt for reasoning
+        aux_prompt = COMMON_VERIFY_PROMPT.format(
+            query=aux_question,
+            gold_ans=aux_gold,
+            pred_ans=reason_text,
+        )
+        aux_reward, reasoning_judge_resp = call_judge(aux_prompt)
+    
+    # 4. Judge Main Answer (ABCDE Choice)
+    main_reward = 0.0
+    main_judge_resp = "N/A"
+    if ground_truth:
+        # We use a simple prompt for the main answer consistency check
+        # Or we can reuse get_prompt if the judge is good at short answers
+        main_prompt = get_prompt(answer_text, ground_truth, "Select the correct option from ABCDE")
+        main_reward, main_judge_resp = call_judge(main_prompt)
+
+    # 5. Combined Reward
     format_reward = -1.0 if is_format_error else 0.0
-    # reward 1
-    # return 0.8 * acc_reward + 0.2 * format_reward + 0.4 * tool_reward_base
-    # reward 2
-    return 0.8 * acc_reward + 0.2 * format_reward + 1.2 * tool_reward
+    tool_reward_base = 1.0 if count_vision_1 > 0 else 0.0
+    # Tool reward is given if vision tags are used AND at least one part is correct
+    tool_reward = 1.0 if count_vision_1 > 0 and (aux_reward > 0.5 or main_reward > 0.5) else 0.0
+    
+    # Split accuracy reward: 0.4 for reasoning, 0.4 for final answer (total 0.8 as before)
+    # Plus format and tool rewards
+    score = (0.4 * aux_reward) + (0.4 * main_reward) + (0.2 * format_reward) + (1.2 * tool_reward)
+    
+    # Log the interaction
+    log_judge_interaction(
+        judge_type="dual_compute_score",
+        question=extra_info.get('question', 'N/A') if extra_info else "N/A",
+        gold_ans=f"Main: {ground_truth} | Aux: {extra_info.get('answer', 'N/A') if extra_info else 'N/A'}",
+        pred_ans=f"Main: {answer_text} | Reasoning: {reason_text[:100]}...",
+        judge_response=f"Reasoning: {reasoning_judge_resp} | Main: {main_judge_resp}",
+        score=score,
+        extra_info=extra_info
+    )
+    
+    return score
 
     # reward 2 
     # return 1.0 * acc_reward + 0.2 * format_reward + 1.0 * tool_reward + 0.2 * tool_reward_base
@@ -339,7 +434,21 @@ def compute_common_reasoning(predict_str: str, ground_truth: str, extra_info=Non
     tool_reward = 1.0 if count_vision_1 > 0 and acc_reward > 0.5 else 0.0
     format_reward = -1.0 if is_format_error else 0.0
     print(f' [DEBUG] query={extra_info["question"]}, {ground_truth=}, {answer_text=}, {acc_reward=}, {format_reward=}')
-    return 0.8 * acc_reward + 0.2 * format_reward + 1.2 * tool_reward
+    
+    score = 0.8 * acc_reward + 0.2 * format_reward + 1.2 * tool_reward
+    
+    # Log the interaction
+    log_judge_interaction(
+        judge_type="compute_common_reasoning",
+        question=extra_info['question'],
+        gold_ans=ground_truth,
+        pred_ans=answer_text,
+        judge_response=response if 'response' in locals() else "N/A (No answer extracted)",
+        score=score,
+        extra_info=extra_info
+    )
+    
+    return score
 
 
 def rule_math_verify(ground_truth, model_answer):
@@ -412,7 +521,21 @@ def compute_score_math(predict_str: str, ground_truth: str, extra_info=None) -> 
     
     format_reward = -1.0 if is_format_error else 0.0
     print(f' [DEBUG] query={extra_info["question"]}, {ground_truth=}, {model_answer=}, {acc_reward=}, {format_reward=}')
-    return 1.2 * acc_reward + 0.4 * format_reward
+    
+    score = 1.2 * acc_reward + 0.4 * format_reward
+    
+    # Log the interaction
+    log_judge_interaction(
+        judge_type="compute_score_math",
+        question=extra_info['question'],
+        gold_ans=ground_truth,
+        pred_ans=model_answer,
+        judge_response= "N/A (Math Rule/Generative)",
+        score=score,
+        extra_info=extra_info
+    )
+    
+    return score
 
 
 if __name__ == '__main__':
